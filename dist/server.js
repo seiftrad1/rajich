@@ -9,9 +9,9 @@ import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
-import { bearerAuth } from "./middleware/bearerAuth";
-import { registerTokenCheck } from "./middleware/registerTokenCheck";
-import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
+import { bearerAuth } from "./middleware/bearerAuth.js";
+import { registerTokenCheck } from "./middleware/registerTokenCheck.js";
+import { requireSuperAdmin } from "./middleware/requireSuperAdmin.js";
 dotenv.config();
 /* ─────────────────────────────────────────────
    env & helpers
