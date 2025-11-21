@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
-import mysql from "mysql2/promise";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
@@ -12,85 +11,83 @@ import { fileURLToPath } from "url";
 import { bearerAuth } from "./middleware/bearerAuth.js";
 import { registerTokenCheck } from "./middleware/registerTokenCheck.js";
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin.js";
+// 🔥 NEW — Supabase PostgreSQL via Pooler
+import postgres from "postgres";
+// Load env
 dotenv.config();
 /* ─────────────────────────────────────────────
-   env & helpers
+    ENV
 ───────────────────────────────────────────── */
 const PORT = Number(process.env.PORT || 3000);
 const NODE_ENV = process.env.NODE_ENV || "development";
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-const DB_HOST = process.env.DB_HOST;
-const DB_PORT = Number(process.env.DB_PORT || 3306);
-const DB_USER = process.env.DB_USER;
-const DB_PASSWORD = process.env.DB_PASSWORD ?? "";
-const DB_NAME = process.env.DB_NAME;
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "2h";
 const COOKIE_SECURE = String(process.env.COOKIE_SECURE || "false") === "true";
 const COOKIE_SAME_SITE = process.env.COOKIE_SAME_SITE || "lax";
+// 🔥 PostgreSQL (Supabase Pooler)
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+    console.error("❌ Missing DATABASE_URL in .env");
+    process.exit(1);
+}
+export const sql = postgres(DATABASE_URL, { ssl: "require" });
+/* ─────────────────────────────────────────────
+    HELPERS
+───────────────────────────────────────────── */
 function signToken(payload) {
-    const options = { expiresIn: JWT_EXPIRES_IN };
-    return jwt.sign(payload, JWT_SECRET, options);
+    return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 function verifyToken(token) {
     return jwt.verify(token, JWT_SECRET);
 }
+function tokenCookieOptions() {
+    return {
+        httpOnly: true,
+        secure: COOKIE_SECURE || NODE_ENV === "production",
+        sameSite: COOKIE_SAME_SITE,
+        maxAge: 2 * 60 * 60 * 1000,
+        path: "/",
+    };
+}
 /* ─────────────────────────────────────────────
-   app & security
+    EXPRESS INIT & SECURITY
 ───────────────────────────────────────────── */
 const app = express();
 app.use(helmet());
 app.use(express.json());
 app.use(cookieParser());
-// app.use(
-//   cors({
-//     origin: (origin, cb) => {
-//       if (!origin) return cb(null, true); // allow Postman/curl
-//       if (CORS_ORIGINS.includes(origin)) return cb(null, true);
-//       return cb(new Error("Not allowed by CORS"));
-//     },
-//     credentials: true,
-//   })
-// );
-// 🚧 Block direct browser access
+// CORS
 const allowedOrigins = [
     "https://smsereus.com",
     "https://www.smsereus.com",
     "https://phpstack-1546497-5981865.cloudwaysapps.com",
-    "http://localhost:3000"
+    "http://localhost:3000",
 ];
 app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        }
-        else {
-            console.warn(`❌ CORS blocked request from: ${origin}`);
-            callback(new Error("Not allowed by CORS"));
-        }
+    origin: (origin, cb) => {
+        if (!origin || allowedOrigins.includes(origin))
+            return cb(null, true);
+        console.log("❌ CORS blocked:", origin);
+        return cb(new Error("Not allowed by CORS"));
     },
-    credentials: true, // ✅ allows cookies (important for your /me login session)
+    credentials: true,
 }));
 app.options("*", cors());
+// bearerAuth stays
 app.use(bearerAuth);
+// Block direct browser access
 app.use((req, res, next) => {
-    const referer = req.get("referer");
     const origin = req.get("origin");
-    const userAgent = req.get("user-agent") || "";
-    // If it's a manual browser visit (no origin or from browser address bar)
-    const isNavigator = !origin && req.method === "GET" && userAgent.includes("Mozilla");
-    // Allow your frontend or API clients
-    const allowedOrigins = ["https://smsereus.com", "https://www.smsereus.com"];
-    const isAllowedOrigin = origin && allowedOrigins.some(o => origin.startsWith(o));
-    if (isNavigator && !isAllowedOrigin) {
-        console.log("🚫 Blocked direct browser access:", req.url);
+    const ua = req.get("user-agent") || "";
+    const isNavigator = !origin && req.method === "GET" && ua.includes("Mozilla");
+    const isAllowed = origin && allowedOrigins.some((o) => origin.startsWith(o));
+    if (isNavigator && !isAllowed) {
+        console.log("🚫 Blocked browser access:", req.url);
         return res.status(403).send("Forbidden");
     }
     next();
 });
+// Rate limit
 app.use(rateLimit({
     windowMs: 60000,
     max: 120,
@@ -98,19 +95,7 @@ app.use(rateLimit({
     legacyHeaders: false,
 }));
 /* ─────────────────────────────────────────────
-   mysql & twilio
-───────────────────────────────────────────── */
-const db = mysql.createPool({
-    host: DB_HOST,
-    port: DB_PORT,
-    user: DB_USER,
-    password: DB_PASSWORD,
-    database: DB_NAME,
-    waitForConnections: true,
-    connectionLimit: 10,
-});
-/* ─────────────────────────────────────────────
-   middlewares
+    AUTH MIDDLEWARE (unchanged)
 ───────────────────────────────────────────── */
 function authMiddleware(req, res, next) {
     const token = req.cookies?.token;
@@ -125,105 +110,88 @@ function authMiddleware(req, res, next) {
         return res.status(403).json({ success: false, message: "Invalid or expired token" });
     }
 }
-function adminOnly(req, res, next) {
-    const user = req.user;
-    if (!user?.isAdmin) {
-        return res.status(403).json({ success: false, message: "Admins only" });
-    }
-    next();
-}
 /* ─────────────────────────────────────────────
-   helpers
+    REGISTER
 ───────────────────────────────────────────── */
-function tokenCookieOptions() {
-    return {
-        httpOnly: true,
-        secure: COOKIE_SECURE || NODE_ENV === "production",
-        sameSite: COOKIE_SAME_SITE, // "lax" (local), "none" (prod across domains w/ https)
-        maxAge: 2 * 60 * 60 * 1000,
-        path: "/",
-    };
-}
-// REGISTER (with optional role)
 app.post("/register", registerTokenCheck, async (req, res) => {
     const { username, email, password, role } = req.body || {};
-    if (!username || !email || !password) {
-        return res
-            .status(400)
-            .json({ success: false, message: "Username, email, and password required." });
-    }
+    if (!username || !email || !password)
+        return res.status(400).json({
+            success: false,
+            message: "Username, email, and password required.",
+        });
     try {
-        const [existing] = await db.query("SELECT id FROM users WHERE username = ? OR email = ?", [username, email]);
+        // EXISTS?
+        const existing = await sql `SELECT id FROM users WHERE username = ${username} OR email = ${email}`;
         if (existing.length > 0)
             return res
                 .status(400)
-                .json({ success: false, message: "Username or email already exists." });
+                .json({ success: false, message: "Username or email exists." });
         const hashed = await bcrypt.hash(password, 12);
-        // 👇 Default to "user" unless specified (e.g. "admin")
-        const userRole = role && role.toLowerCase() === "admin" ? "admin" : "user";
-        await db.query("INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)", [username, email, hashed, userRole]);
-        res.json({ success: true, message: `Registered successfully as ${userRole}.` });
+        const userRole = role?.toLowerCase() === "admin" ? "admin" : "user";
+        await sql `
+      INSERT INTO users (username, email, password, role)
+      VALUES (${username}, ${email}, ${hashed}, ${userRole})
+    `;
+        return res.json({
+            success: true,
+            message: `Registered successfully as ${userRole}.`,
+        });
     }
     catch (e) {
         console.error("Register error:", e);
         res.status(500).json({ success: false, message: "Database error." });
     }
 });
+/* ─────────────────────────────────────────────
+    LOGIN
+───────────────────────────────────────────── */
 app.post("/login", async (req, res) => {
     const { username, email, password } = req.body || {};
     const identifier = username || email;
-    if (!identifier || !password) {
+    if (!identifier || !password)
         return res.status(400).json({
             success: false,
-            message: "Username/email and password required."
+            message: "Username/email and password required.",
         });
-    }
-    // REAL USER IP (Cloudways compatible)
+    // Real IP
     let ip = req.headers["cf-connecting-ip"] ||
         req.headers["x-forwarded-for"]?.split(",")[0].trim() ||
         req.socket.remoteAddress ||
         "unknown";
-    // Remove IPv6 prefix (like ::ffff:)
     if (ip.startsWith("::ffff:"))
         ip = ip.replace("::ffff:", "");
     const userAgent = req.headers["user-agent"] || "unknown";
     try {
-        const [rows] = await db.query("SELECT * FROM users WHERE username = ? OR email = ?", [identifier, identifier]);
+        // GET USER
+        const rows = await sql `SELECT * FROM users WHERE username = ${identifier} OR email = ${identifier}`;
         const user = rows[0];
-        /* ---------------------------------------------------------
-           1️⃣ USER NOT FOUND → log failed attempt
-        --------------------------------------------------------- */
         if (!user) {
-            await db.query(`INSERT INTO login_history (user_id, username, ip_address, user_agent, success)
-         VALUES (?, ?, ?, ?, ?)`, [null, identifier, ip, userAgent, false]);
+            await sql `
+        INSERT INTO login_history (user_id, username, ip_address, user_agent, success)
+        VALUES (null, ${identifier}, ${ip}, ${userAgent}, false)
+      `;
             return res.status(404).json({ success: false, message: "User not found." });
         }
-        /* ---------------------------------------------------------
-           2️⃣ ACCOUNT DEACTIVATED → block + log failed attempt
-        --------------------------------------------------------- */
         if (user.status === "inactive") {
-            await db.query(`INSERT INTO login_history (user_id, username, ip_address, user_agent, success)
-         VALUES (?, ?, ?, ?, ?)`, [user.id, user.username, ip, userAgent, false]);
+            await sql `
+        INSERT INTO login_history (user_id, username, ip_address, user_agent, success)
+        VALUES (${user.id}, ${user.username}, ${ip}, ${userAgent}, false)
+      `;
             return res.status(403).json({
                 success: false,
-                message: "Account is deactivated. Contact administrator."
+                message: "Account is deactivated. Contact administrator.",
             });
         }
-        /* ---------------------------------------------------------
-           3️⃣ WRONG PASSWORD → log failed attempt
-        --------------------------------------------------------- */
         const valid = await bcrypt.compare(password, user.password);
         if (!valid) {
-            await db.query(`INSERT INTO login_history (user_id, username, ip_address, user_agent, success)
-         VALUES (?, ?, ?, ?, ?)`, [user.id, user.username, ip, userAgent, false]);
-            return res.status(401).json({
-                success: false,
-                message: "Invalid credentials."
-            });
+            await sql `
+        INSERT INTO login_history (user_id, username, ip_address, user_agent, success)
+        VALUES (${user.id}, ${user.username}, ${ip}, ${userAgent}, false)
+      `;
+            return res.status(401).json({ success: false, message: "Invalid credentials." });
         }
-        /* ---------------------------------------------------------
-           4️⃣ SUCCESS LOGIN → generate JWT + log success
-        --------------------------------------------------------- */
+        // JWT
         const token = signToken({
             id: user.id,
             email: user.email,
@@ -233,8 +201,10 @@ app.post("/login", async (req, res) => {
             isSuperAdmin: user.role === "superadmin",
         });
         res.cookie("token", token, tokenCookieOptions());
-        await db.query(`INSERT INTO login_history (user_id, username, ip_address, user_agent, success)
-       VALUES (?, ?, ?, ?, ?)`, [user.id, user.username, ip, userAgent, true]);
+        await sql `
+      INSERT INTO login_history (user_id, username, ip_address, user_agent, success)
+      VALUES (${user.id}, ${user.username}, ${ip}, ${userAgent}, true)
+    `;
         return res.json({
             success: true,
             message: "Login successful.",
@@ -244,18 +214,18 @@ app.post("/login", async (req, res) => {
                 email: user.email,
                 role: user.role,
                 isAdmin: user.role === "admin" || user.role === "superadmin",
-                isSuperAdmin: user.role === "superadmin"
-            }
+                isSuperAdmin: user.role === "superadmin",
+            },
         });
     }
     catch (e) {
         console.error("Login error:", e);
-        return res.status(500).json({
-            success: false,
-            message: "Database error."
-        });
+        return res.status(500).json({ success: false, message: "Database error." });
     }
 });
+/* ─────────────────────────────────────────────
+    LOGOUT + /USER
+───────────────────────────────────────────── */
 app.post("/logout", (_req, res) => {
     res.clearCookie("token", { path: "/" });
     res.json({ success: true, message: "Logged out" });
@@ -269,49 +239,17 @@ app.get("/user", authMiddleware, (req, res) => {
             username: u.username,
             email: u.email,
             role: u.role,
-            isAdmin: u.role === "admin" || u.role === "superadmin",
-            isSuperAdmin: u.role === "superadmin"
+            isAdmin: u.isAdmin,
+            isSuperAdmin: u.isSuperAdmin,
         },
     });
 });
-// Fix "__dirname" for ES Modules (used by TypeScript when compiled to ESM)
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-// Serve frontend build folder
-const frontendPath = path.join(__dirname, "../frontend/dist"); // 👈 change if different
-app.use(express.static(frontendPath));
-// Example test route (optional)
-app.get("/hello", (_req, res) => {
-    res.json({ message: "Hello from backend!" });
-});
-// Fallback — send React index.html for all non-API routes
-// app.get("*", (req, res, next) => {
-//   if (req.path.startsWith("/")) return next(); // don't interfere with API
-//   res.sendFile(path.join(frontendPath, "index.html"));
-// });
-// All your API routes here (login, sms, logs, etc.)
-// 👇 Always at the very bottom:
 /* ─────────────────────────────────────────────
-   start
+    USERS LIST (ADMIN)
 ───────────────────────────────────────────── */
-app.get("/health", (_req, res) => res.json({ ok: true, env: NODE_ENV }));
-app.get("/login-history", authMiddleware, requireSuperAdmin, async (req, res) => {
-    try {
-        const [rows] = await db.query(`SELECT lh.*, u.username AS user_username, u.email AS user_email
-       FROM login_history lh
-       LEFT JOIN users u ON u.id = lh.user_id
-       ORDER BY lh.id DESC
-       LIMIT 200`);
-        res.json({ success: true, history: rows });
-    }
-    catch (err) {
-        console.error("Login history error:", err);
-        res.status(500).json({ success: false, message: "Cannot load login history" });
-    }
-});
 app.get("/users", authMiddleware, requireSuperAdmin, async (req, res) => {
     try {
-        const [rows] = await db.query("SELECT * FROM users ORDER BY id DESC");
+        const rows = await sql `SELECT * FROM users ORDER BY id DESC`;
         res.json({ success: true, users: rows });
     }
     catch (err) {
@@ -319,14 +257,21 @@ app.get("/users", authMiddleware, requireSuperAdmin, async (req, res) => {
         res.status(500).json({ success: false, message: "Cannot fetch users" });
     }
 });
+/* ─────────────────────────────────────────────
+    CREATE USER (ADMIN)
+───────────────────────────────────────────── */
 app.post("/users", authMiddleware, requireSuperAdmin, async (req, res) => {
     const { username, email, password, role } = req.body;
-    if (!username || !email || !password) {
-        return res.status(400).json({ success: false, message: "Missing fields" });
-    }
+    if (!username || !email || !password)
+        return res
+            .status(400)
+            .json({ success: false, message: "Missing fields" });
     try {
         const hashed = await bcrypt.hash(password, 12);
-        await db.query("INSERT INTO users (username, email, password, role) VALUES (?, ?, ?, ?)", [username, email, hashed, role || "user"]);
+        await sql `
+      INSERT INTO users (username, email, password, role)
+      VALUES (${username}, ${email}, ${hashed}, ${role || "user"})
+    `;
         res.json({ success: true, message: "User created" });
     }
     catch (err) {
@@ -334,11 +279,18 @@ app.post("/users", authMiddleware, requireSuperAdmin, async (req, res) => {
         res.status(500).json({ success: false, message: "Cannot create user" });
     }
 });
+/* ─────────────────────────────────────────────
+    UPDATE USER (ADMIN)
+───────────────────────────────────────────── */
 app.patch("/users/:id", authMiddleware, requireSuperAdmin, async (req, res) => {
     const { username, email, role } = req.body;
     const { id } = req.params;
     try {
-        await db.query("UPDATE users SET username=?, email=?, role=? WHERE id=?", [username, email, role, id]);
+        await sql `
+      UPDATE users
+      SET username = ${username}, email = ${email}, role = ${role}
+      WHERE id = ${id}
+    `;
         res.json({ success: true, message: "User updated" });
     }
     catch (err) {
@@ -346,14 +298,19 @@ app.patch("/users/:id", authMiddleware, requireSuperAdmin, async (req, res) => {
         res.status(500).json({ success: false, message: "Cannot update user" });
     }
 });
+/* ─────────────────────────────────────────────
+    CHANGE USER PASSWORD (ADMIN)
+───────────────────────────────────────────── */
 app.patch("/users/:id/password", authMiddleware, requireSuperAdmin, async (req, res) => {
     const { newPassword } = req.body;
     const { id } = req.params;
     if (!newPassword)
-        return res.status(400).json({ success: false, message: "New password required" });
+        return res
+            .status(400)
+            .json({ success: false, message: "New password required" });
     try {
         const hashed = await bcrypt.hash(newPassword, 12);
-        await db.query("UPDATE users SET password=? WHERE id=?", [hashed, id]);
+        await sql `UPDATE users SET password = ${hashed} WHERE id = ${id}`;
         res.json({ success: true, message: "Password updated" });
     }
     catch (err) {
@@ -361,10 +318,13 @@ app.patch("/users/:id/password", authMiddleware, requireSuperAdmin, async (req, 
         res.status(500).json({ success: false, message: "Cannot update password" });
     }
 });
+/* ─────────────────────────────────────────────
+    DELETE USER (ADMIN)
+───────────────────────────────────────────── */
 app.delete("/users/:id", authMiddleware, requireSuperAdmin, async (req, res) => {
     const { id } = req.params;
     try {
-        await db.query("DELETE FROM users WHERE id=?", [id]);
+        await sql `DELETE FROM users WHERE id = ${id}`;
         res.json({ success: true, message: "User deleted" });
     }
     catch (err) {
@@ -372,23 +332,60 @@ app.delete("/users/:id", authMiddleware, requireSuperAdmin, async (req, res) => 
         res.status(500).json({ success: false, message: "Cannot delete user" });
     }
 });
+/* ─────────────────────────────────────────────
+    TOGGLE ACTIVE / INACTIVE (ADMIN)
+───────────────────────────────────────────── */
 app.patch("/users/:id/toggle-active", authMiddleware, requireSuperAdmin, async (req, res) => {
     const { id } = req.params;
     try {
-        const [rows] = await db.query("SELECT status FROM users WHERE id = ?", [id]);
+        const rows = await sql `SELECT status FROM users WHERE id = ${id}`;
         const user = rows[0];
         if (!user)
             return res.status(404).json({ success: false, message: "User not found" });
         const newStatus = user.status === "active" ? "inactive" : "active";
-        await db.query("UPDATE users SET status = ? WHERE id = ?", [newStatus, id]);
-        return res.json({ success: true, status: newStatus });
+        await sql `UPDATE users SET status = ${newStatus} WHERE id = ${id}`;
+        res.json({ success: true, status: newStatus });
     }
     catch (err) {
         console.error("Toggle error:", err);
         res.status(500).json({ success: false, message: "Toggle failed" });
     }
 });
+/* ─────────────────────────────────────────────
+    LOGIN HISTORY (ADMIN)
+───────────────────────────────────────────── */
+app.get("/login-history", authMiddleware, requireSuperAdmin, async (_req, res) => {
+    try {
+        const rows = await sql `
+      SELECT lh.*, u.username AS user_username, u.email AS user_email
+      FROM login_history lh
+      LEFT JOIN users u ON u.id = lh.user_id
+      ORDER BY lh.id DESC
+      LIMIT 200
+    `;
+        res.json({ success: true, history: rows });
+    }
+    catch (err) {
+        console.error("Login history error:", err);
+        res.status(500).json({ success: false, message: "Cannot load login history" });
+    }
+});
+/* ─────────────────────────────────────────────
+    FRONTEND BUILD SERVING
+───────────────────────────────────────────── */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const frontendPath = path.join(__dirname, "../frontend/dist");
+app.use(express.static(frontendPath));
+app.get("/hello", (_req, res) => {
+    res.json({ message: "Hello from backend!" });
+});
+// Single Page App Fallback
 app.get("*", (req, res) => {
     res.sendFile(path.join(frontendPath, "index.html"));
 });
+/* ─────────────────────────────────────────────
+    START SERVER
+───────────────────────────────────────────── */
+app.get("/health", (_req, res) => res.json({ ok: true, env: NODE_ENV }));
 app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Server running on port ${PORT} (${NODE_ENV})`));
